@@ -21,8 +21,9 @@ import importlib
 
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.serialization import deserialize_message
+from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 
 from .tcp_sender import UnityTcpSender
 from .client import ClientThread
@@ -30,6 +31,9 @@ from .subscriber import RosSubscriber
 from .publisher import RosPublisher
 from .service import RosService
 from .unity_service import UnityService
+
+# Smallest MultiThreadedExecutor pool to run with. See setup_executor.
+MIN_EXECUTOR_THREADS = 8
 
 
 class TcpServer(Node):
@@ -75,6 +79,11 @@ class TcpServer(Node):
         self.syscommands = SysCommands(self)
         self.pending_srv_id = None
         self.pending_srv_is_request = False
+        # Registrations arrive on a client thread while the executor spins on
+        # the main one, and two Unity clients connecting at once would other-
+        # wise race over the same topic's entry -- one destroying the node the
+        # other had just put in the table.
+        self.registration_lock = threading.RLock()
 
     def start(self, publishers=None, subscribers=None):
         if publishers is not None:
@@ -143,12 +152,18 @@ class TcpServer(Node):
             MultiThreadedExecutor allows us to set the number of threads
             needed as well as the nodes that need to be spun.
         """
-        num_threads = (
+        # The tables are empty until Unity connects and registers, so sizing
+        # the pool from them alone leaves one worker for the whole run. A Unity
+        # service call blocks its worker until Unity answers (see
+        # UnityTcpSender.send_unity_service_request), and with a single worker
+        # that stalls every other callback with it, so keep a floor.
+        num_threads = max(
+            MIN_EXECUTOR_THREADS,
             len(self.publishers_table.keys())
             + len(self.subscribers_table.keys())
             + len(self.ros_services_table.keys())
             + len(self.unity_services_table.keys())
-            + 1
+            + 1,
         )
         executor = MultiThreadedExecutor(num_threads)
 
@@ -164,13 +179,48 @@ class TcpServer(Node):
             executor.add_node(ros_node)
 
         self.executor = executor
-        executor.spin()
+        self.spin_until_shutdown(executor)
+
+    def spin_until_shutdown(self, executor):
+        """
+            executor.spin(), but surviving a node torn down mid-wait.
+
+            rclpy builds its wait set from a snapshot of the executor's nodes:
+            it checks each waitable is alive, and adds it to the set a few
+            lines later. A node destroyed in that window -- which is what
+            re-registering a topic does, from the client thread -- makes the
+            add raise InvalidHandle straight out of spin(), and the endpoint
+            exits. Registering is ordered to keep that window shut (see
+            unregister_node) and a reconnect no longer churns nodes at all, so
+            landing here should be rare; it is caught anyway, because the cost
+            is a whole Unity session and the recovery is only to build the wait
+            set again. wait_for_ready_callbacks discards the generator that
+            raised and makes a new one on the next call, so continuing is
+            enough -- there is no state left to repair.
+        """
+        while rclpy.ok():
+            try:
+                executor.spin_once()
+            except ExternalShutdownException:
+                return
+            except _rclpy.InvalidHandle:
+                self.logwarn(
+                    "a node was destroyed while the wait set was being built; continuing"
+                )
 
     def unregister_node(self, old_node):
-        if old_node is not None:
-            old_node.unregister()
-            if self.executor is not None:
-                self.executor.remove_node(old_node)
+        """
+            Take a node out of the executor, then tear it down.
+
+            Not the other way round: destroying first leaves the executor
+            holding entities whose handles are already gone, which is what used
+            to take the endpoint down on a Unity reconnect.
+        """
+        if old_node is None:
+            return
+        if self.executor is not None:
+            self.executor.remove_node(old_node)
+        old_node.unregister()
 
     def destroy_nodes(self):
         """
@@ -192,6 +242,35 @@ class SysCommands:
     def __init__(self, tcp_server):
         self.tcp_server = tcp_server
 
+    def register(self, table, topic, signature, create):
+        """
+            Put the node for `topic` into `table`, reusing what is there.
+
+            Unity re-sends its whole registration list every time it connects,
+            so on a reconnect each of these calls asks for a node identical to
+            the one already running. Building the replacement means destroying
+            a live node -- twenty-odd of them in a row -- while the executor is
+            spinning on it, and racing the wait set it is part of. When the
+            registration is the same as the one in place, leave the node alone:
+            nothing about it needs to change, and the executor's entities stay
+            put across the reconnect.
+
+            `signature` is everything that would make a different node, so an
+            unchanged one is only ever reused for an unchanged request.
+        """
+        with self.tcp_server.registration_lock:
+            old_node = table.get(topic)
+            if getattr(old_node, "registration", None) == signature:
+                return
+            # Destroyed before the replacement is created, not after: both
+            # carry the same node name, derived from the topic.
+            self.tcp_server.unregister_node(old_node)
+            new_node = create()
+            new_node.registration = signature
+            table[topic] = new_node
+            if self.tcp_server.executor is not None:
+                self.tcp_server.executor.add_node(new_node)
+
     def subscribe(self, topic, message_name):
         if topic == "":
             self.tcp_server.send_unity_error(
@@ -208,14 +287,12 @@ class SysCommands:
             )
             return
 
-        old_node = self.tcp_server.subscribers_table.get(topic)
-        if old_node is not None:
-            self.tcp_server.unregister_node(old_node)
-
-        new_subscriber = RosSubscriber(topic, message_class, self.tcp_server)
-        self.tcp_server.subscribers_table[topic] = new_subscriber
-        if self.tcp_server.executor is not None:
-            self.tcp_server.executor.add_node(new_subscriber)
+        self.register(
+            self.tcp_server.subscribers_table,
+            topic,
+            ("subscribe", message_class),
+            lambda: RosSubscriber(topic, message_class, self.tcp_server),
+        )
 
         self.tcp_server.loginfo("RegisterSubscriber({}, {}) OK".format(topic, message_class))
 
@@ -235,15 +312,12 @@ class SysCommands:
             )
             return
 
-        old_node = self.tcp_server.publishers_table.get(topic)
-        if old_node is not None:
-            self.tcp_server.unregister_node(old_node)
-
-        new_publisher = RosPublisher(topic, message_class, queue_size=queue_size, latch=latch)
-
-        self.tcp_server.publishers_table[topic] = new_publisher
-        if self.tcp_server.executor is not None:
-            self.tcp_server.executor.add_node(new_publisher)
+        self.register(
+            self.tcp_server.publishers_table,
+            topic,
+            ("publish", message_class, queue_size, latch),
+            lambda: RosPublisher(topic, message_class, queue_size=queue_size, latch=latch),
+        )
 
         self.tcp_server.loginfo("RegisterPublisher({}, {}) OK".format(topic, message_class))
 
@@ -264,15 +338,12 @@ class SysCommands:
             )
             return
 
-        old_node = self.tcp_server.ros_services_table.get(topic)
-        if old_node is not None:
-            self.tcp_server.unregister_node(old_node)
-
-        new_service = RosService(topic, message_class)
-
-        self.tcp_server.ros_services_table[topic] = new_service
-        if self.tcp_server.executor is not None:
-            self.tcp_server.executor.add_node(new_service)
+        self.register(
+            self.tcp_server.ros_services_table,
+            topic,
+            ("ros_service", message_class),
+            lambda: RosService(topic, message_class),
+        )
 
         self.tcp_server.loginfo("RegisterRosService({}, {}) OK".format(topic, message_class))
 
@@ -294,15 +365,12 @@ class SysCommands:
             )
             return
 
-        old_node = self.tcp_server.unity_services_table.get(topic)
-        if old_node is not None:
-            self.tcp_server.unregister_node(old_node)
-
-        new_service = UnityService(str(topic), message_class, self.tcp_server)
-
-        self.tcp_server.unity_services_table[topic] = new_service
-        if self.tcp_server.executor is not None:
-            self.tcp_server.executor.add_node(new_service)
+        self.register(
+            self.tcp_server.unity_services_table,
+            topic,
+            ("unity_service", message_class),
+            lambda: UnityService(str(topic), message_class, self.tcp_server),
+        )
 
         self.tcp_server.loginfo("RegisterUnityService({}, {}) OK".format(topic, message_class))
 

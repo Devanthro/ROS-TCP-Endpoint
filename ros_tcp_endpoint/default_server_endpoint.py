@@ -14,7 +14,12 @@ def main(args=None):
     tcp_server.setup_executor()
 
     tcp_server.destroy_nodes()
-    rclpy.shutdown()
+    # Ctrl-C shuts the context down from rclpy's own signal handler, and
+    # shutting down an already shut down context raises rather than doing
+    # nothing -- which turned every clean stop into a traceback and a non-zero
+    # exit code.
+    if rclpy.ok():
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
